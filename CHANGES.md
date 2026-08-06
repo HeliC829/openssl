@@ -31,6 +31,12 @@ OpenSSL Releases
 
 ### Changes between 4.0 and 4.1 [xx XXX xxxx]
 
+ * Added a GHASH assembly implementation for LoongArch64, used by AES-GCM.
+   A scalar 4-bit variant is always available, and LSX and LASX variants
+   are selected at run time when the CPU supports them.
+
+   *Julian Zhu*
+
  * Added `CMS_add_standard_smimecap_ex()`, which populates an SMIMECapabilities
    list using `EVP_CIPHER_fetch()` and `EVP_MD_fetch()` so that only algorithms
    available in the active providers are advertised.  `PKCS7_sign_add_signer()`
