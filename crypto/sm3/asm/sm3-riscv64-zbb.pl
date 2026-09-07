@@ -67,6 +67,9 @@ my ($A, $B, $C, $D ,$E ,$F ,$G ,$H) = ("s2", "s3", "s4", "s5", "s6", "s7", "s8",
 my ($W9, $W10, $W11, $W12, $W13 ,$W14 ,$W15) = ("s0", "s1", "a5", "a6", "a7", "s10", "s11");
 my @W = (undef, undef, undef, undef, undef, undef, undef, undef, undef,
         $W9, $W10, $W11, $W12, $W13, $W14, $W15);
+# Misaligned input: aligned base pointer and funnel shift amounts. They are
+# only live while the block is read in, so they share the round temporaries.
+my ($BASE, $SHL, $SHR) = ($T3, $T4, $T5);
 
 # W[9..15] live in registers and the rest in the stack buffer. Wreg() names the
 # register holding a word; Wload()/Wstore() emit nothing for register words.
@@ -235,48 +238,57 @@ ___
     return $code;
 }
 
+# Loads the doubleword holding W[$index] and W[$index+1]. For misaligned input
+# it is combined from two aligned loads, which never cross into another page.
+sub loadPair {
+    my ($ALIGNED, $index, $dst) = @_;
+    if ($ALIGNED) {
+        return "ld $dst, 4*$index($INP)";
+    }
+    my $code=<<___;
+    ld $TMP0, 4*$index($BASE)
+    ld $TMP1, (4*$index+8)($BASE)
+    srl $dst, $TMP0, $SHL
+    sll $TMP1, $TMP1, $SHR
+    or $dst, $dst, $TMP1
+___
+    return $code;
+}
+
 # One ld plus rev8 yields two message words, the first in the top half
 sub loadMsgRev32 {
-    my $code=<<___;
-
-    ld $T1, 0($INP)
+    my ($ALIGNED) = @_;
+    my $code = "";
+    if (!$ALIGNED) {
+        $code .= <<___;
+    andi $BASE, $INP, -8
+    andi $SHL, $INP, 7
+    slli $SHL, $SHL, 3
+    li $SHR, 64
+    sub $SHR, $SHR, $SHL
+___
+    }
+    for my $i (0, 2, 4, 6) {
+        $code .= <<___;
+    @{[loadPair $ALIGNED, $i, $T1]}
     @{[rev8 $T1, $T1]}
     srli $T2, $T1, 32
-    sw $T2, 0($ADDR)
-    sw $T1, 4($ADDR)
-
-    ld $T1, 8($INP)
-    @{[rev8 $T1, $T1]}
-    srli $T2, $T1, 32
-    sw $T2, 8($ADDR)
-    sw $T1, 12($ADDR)
-
-    ld $T1, 16($INP)
-    @{[rev8 $T1, $T1]}
-    srli $T2, $T1, 32
-    sw $T2, 16($ADDR)
-    sw $T1, 20($ADDR)
-
-    ld $T1, 24($INP)
-    @{[rev8 $T1, $T1]}
-    srli $T2, $T1, 32
-    sw $T2, 24($ADDR)
-    sw $T1, 28($ADDR)
-
-    ld $W9, 32($INP)
+    sw $T2, @{[4*$i]}($ADDR)
+    sw $T1, @{[4*$i+4]}($ADDR)
+___
+    }
+    $code .= <<___;
+    @{[loadPair $ALIGNED, 8, $W9]}
     @{[rev8 $W9, $W9]}
     srli $T2, $W9, 32
     sw $T2, 32($ADDR)
-
-    ld $W11, 40($INP)
+    @{[loadPair $ALIGNED, 10, $W11]}
     @{[rev8 $W11, $W11]}
     srli $W10, $W11, 32
-
-    ld $W13, 48($INP)
+    @{[loadPair $ALIGNED, 12, $W13]}
     @{[rev8 $W13, $W13]}
     srli $W12, $W13, 32
-
-    ld $W15, 56($INP)
+    @{[loadPair $ALIGNED, 14, $W15]}
     @{[rev8 $W15, $W15]}
     srli $W14, $W15, 32
 ___
@@ -324,7 +336,13 @@ L_round_loop:
     # Decrement length by 1
     addi $LEN, $LEN, -1
 
-@{[loadMsgRev32]}
+    andi $T1, $INP, 7
+    bnez $T1, L_load_unaligned
+@{[loadMsgRev32 1]}
+    j L_rounds
+L_load_unaligned:
+@{[loadMsgRev32 0]}
+L_rounds:
 
     @{[SM3ROUND1 0, $A, $B, $C, $D, $E, $F, $G, $H]}
     @{[EXPAND 0]}
