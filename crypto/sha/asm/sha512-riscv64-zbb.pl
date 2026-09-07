@@ -62,16 +62,32 @@ my $K512 = "K512";
 # Function arguments
 my ($INP, $LEN, $ADDR) = ("a1", "a2", "sp");
 my ($KT, $T1, $T2, $T3, $T4, $T5, $T6) = ("t0", "t1", "t2", "t3", "t4", "t5", "t6");
+# Funnel shift amounts for misaligned input
+my ($SHL, $SHR) = ("a3", "a4");
 # Register pairs indexed by round parity, reused by later rounds:
 # W = W[i], U = W[i-15] (next round's W[i-16]), X = a ^ b (next round's b ^ c)
 my ($W0, $W1, $U0, $U1, $X0, $X1) = ("a5", "a6", "a7", "s0", "s1", "s10");
 my ($A, $B, $C, $D ,$E ,$F ,$G ,$H) = ("s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9");
 
 sub MSGSCHEDULE0 {
-    my ($index) = @_;
+    my ($ALIGNED, $index) = @_;
     my $Wi = ($index & 1) ? $W1 : $W0;
-    my $code=<<___;
+    my $code;
+    if ($ALIGNED) {
+        $code=<<___;
     ld $Wi, 8*$index($INP)
+___
+    } else {
+        # $INP is 8 byte aligned here, so combine two aligned loads
+        $code=<<___;
+    ld $T5, 8*$index($INP)
+    ld $T6, (8*$index+8)($INP)
+    srl $Wi, $T5, $SHL
+    sll $T6, $T6, $SHR
+    or $Wi, $Wi, $T6
+___
+    }
+    $code .= <<___;
     @{[rev8 $Wi, $Wi]}
     sd $Wi, 8*$index($ADDR)
 ___
@@ -168,9 +184,9 @@ ___
 }
 
 sub SHA512ROUND0 {
-    my ($INDEX, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
+    my ($ALIGNED, $INDEX, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
     my $code=<<___;
-    @{[MSGSCHEDULE0 $INDEX]}
+    @{[MSGSCHEDULE0 $ALIGNED, $INDEX]}
     @{[SHA512ROUND $INDEX, $a, $b, $c, $d, $e, $f, $g, $h]}
 ___
 
@@ -184,6 +200,18 @@ sub SHA512ROUND1 {
     @{[SHA512ROUND $INDEX, $a, $b, $c, $d, $e, $f, $g, $h]}
 ___
 
+    return $code;
+}
+
+# Rounds 0..15, which read the message block
+sub SHA512ROUNDS0 {
+    my ($ALIGNED) = @_;
+    my @s = ($A, $B, $C, $D, $E, $F, $G, $H);
+    my $code = "";
+    for my $i (0 .. 15) {
+        $code .= SHA512ROUND0($ALIGNED, $i, @s);
+        unshift @s, pop @s;
+    }
     return $code;
 }
 
@@ -224,6 +252,15 @@ sha512_block_data_order_zbb:
     ld $G, 48(a0)
     ld $H, 56(a0)
 
+    # For misaligned input, round \$INP down and set up the funnel shift.
+    # \$SHL stays non-zero for the whole call and doubles as the flag.
+    andi $SHL, $INP, 7
+    beqz $SHL, L_round_loop
+    andi $INP, $INP, -8
+    slli $SHL, $SHL, 3
+    li $T1, 64
+    sub $SHR, $T1, $SHL
+
 L_round_loop:
     # Decrement length by 1
     addi $LEN, $LEN, -1
@@ -231,26 +268,12 @@ L_round_loop:
     # b ^ c for round 0's Maj
     xor $X1, $B, $C
 
-    @{[SHA512ROUND0 0, $A, $B, $C, $D, $E, $F, $G, $H]}
-    @{[SHA512ROUND0 1, $H, $A, $B, $C, $D, $E, $F, $G]}
-    @{[SHA512ROUND0 2, $G, $H, $A, $B, $C, $D, $E, $F]}
-    @{[SHA512ROUND0 3, $F, $G, $H, $A, $B, $C, $D, $E]}
-
-    @{[SHA512ROUND0 4, $E, $F, $G, $H, $A, $B, $C, $D]}
-    @{[SHA512ROUND0 5, $D, $E, $F, $G, $H, $A, $B, $C]}
-    @{[SHA512ROUND0 6, $C, $D, $E, $F, $G, $H, $A, $B]}
-    @{[SHA512ROUND0 7, $B, $C, $D, $E, $F, $G, $H, $A]}
-
-    @{[SHA512ROUND0 8, $A, $B, $C, $D, $E, $F, $G, $H]}
-    @{[SHA512ROUND0 9, $H, $A, $B, $C, $D, $E, $F, $G]}
-    @{[SHA512ROUND0 10, $G, $H, $A, $B, $C, $D, $E, $F]}
-    @{[SHA512ROUND0 11, $F, $G, $H, $A, $B, $C, $D, $E]}
-
-    @{[SHA512ROUND0 12, $E, $F, $G, $H, $A, $B, $C, $D]}
-    @{[SHA512ROUND0 13, $D, $E, $F, $G, $H, $A, $B, $C]}
-    @{[SHA512ROUND0 14, $C, $D, $E, $F, $G, $H, $A, $B]}
-    @{[SHA512ROUND0 15, $B, $C, $D, $E, $F, $G, $H, $A]}
-
+    bnez $SHL, L_load_unaligned
+@{[SHA512ROUNDS0 1]}
+    j L_message_schedule
+L_load_unaligned:
+@{[SHA512ROUNDS0 0]}
+L_message_schedule:
     # W[0], the W[i-16] of round 16
     ld $U1, 0($ADDR)
 
