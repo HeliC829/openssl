@@ -2,7 +2,7 @@
 # This file is dual-licensed, meaning that you can use it under your
 # choice of either of the following two licenses:
 #
-# Copyright 2025 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2025-2026 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the Apache License 2.0 (the "License"). You can obtain
 # a copy in the file LICENSE in the source distribution or at
@@ -10,7 +10,7 @@
 #
 # or
 #
-# Copyright (c) 2025, Julian Zhu <julian.oerv@isrc.iscas.ac.cn>
+# Copyright (c) 2025-2026, Julian Zhu <julian.oerv@isrc.iscas.ac.cn>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -61,31 +61,37 @@ my $SM3K = "SM3K";
 
 # Function arguments
 my ($INP, $LEN, $ADDR) = ("a1", "a2", "sp");
-my ($TMP0, $TMP1, $Wi, $Wj) = ("a3", "a4", "t5", "t6");
+my ($TMP0, $TMP1) = ("a3", "a4");
 my ($KT, $T1, $T2, $T3, $T4, $T5, $T6) = ("t0", "t1", "t2", "t3", "t4", "t5", "t6");
 my ($A, $B, $C, $D ,$E ,$F ,$G ,$H) = ("s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9");
 my ($W9, $W10, $W11, $W12, $W13 ,$W14 ,$W15) = ("s0", "s1", "a5", "a6", "a7", "s10", "s11");
 my @W = (undef, undef, undef, undef, undef, undef, undef, undef, undef,
         $W9, $W10, $W11, $W12, $W13, $W14, $W15);
 
-sub load {
-    my ($rd, $index, $offset) = @_;
-    my $masked = (($index-$offset)& 0x0F);
-    if ($masked < 9) {
-        return "lw $rd, (($index-$offset)&0x0F)*4($ADDR)";
-    } else {
-        return "mv $rd, $W[$masked]";
-    }
+# W[9..15] live in registers and the rest in the stack buffer. Wreg() names the
+# register holding a word; Wload()/Wstore() emit nothing for register words.
+sub Wreg {
+    my ($index, $offset, $scratch) = @_;
+    my $masked = (($index-$offset) & 0x0F);
+    return $masked < 9 ? $scratch : $W[$masked];
 }
 
-sub store {
-    my ($rs, $index, $offset) = @_;
-    my $masked = (($index-$offset)& 0x0F);
-    if ($masked < 9) {
-        return "sw $rs, (($index-$offset)&0x0F)*4($ADDR)";
-    } else {
-        return "mv $W[$masked], $rs";
+sub Wload {
+    my ($index, $offset, $scratch) = @_;
+    my $masked = (($index-$offset) & 0x0F);
+    if ($masked >= 9) {
+        return "";
     }
+    return "lw $scratch, (($index-$offset)&0x0F)*4($ADDR)";
+}
+
+sub Wstore {
+    my ($index, $offset, $scratch) = @_;
+    my $masked = (($index-$offset) & 0x0F);
+    if ($masked >= 9) {
+        return "";
+    }
+    return "sw $scratch, (($index-$offset)&0x0F)*4($ADDR)";
 }
 
 sub FG0 {
@@ -101,8 +107,8 @@ sub FF1 {
     my ($X, $Y, $Z) = @_;
     my $code=<<___;
     or $TMP0, $X, $Y
-    and $TMP0, $TMP0, $Z
     and $TMP1, $X, $Y
+    and $TMP0, $TMP0, $Z
     or $TMP0, $TMP0, $TMP1
 ___
     return $code;
@@ -123,8 +129,8 @@ sub P0 {
     my $code=<<___;
     @{[roriw $TMP0, $X, 23]}
     @{[roriw $TMP1, $X, 15]}
-    xor $TMP0, $TMP0, $TMP1
-    xor $X, $X, $TMP0
+    xor $TMP0, $TMP0, $X
+    xor $X, $TMP0, $TMP1
 ___
     return $code;
 }
@@ -134,54 +140,65 @@ sub P1 {
     my $code=<<___;
     @{[roriw $TMP0, $X, 17]}
     @{[roriw $TMP1, $X, 9]}
-    xor $TMP0, $TMP0, $TMP1
-    xor $X, $X, $TMP0
+    xor $TMP0, $TMP0, $X
+    xor $X, $TMP0, $TMP1
 ___
     return $code;
 }
 
+# W[j] = P1(W[j-16] ^ W[j-9] ^ ROTL(W[j-3], 15)) ^ ROTL(W[j-13], 7) ^ W[j-6]
 sub EXPAND {
     my ($index) = @_;
-    my $code = <<___;
-    @{[load $T1, $index, 0]}
-    @{[load $T2, $index, 9]}
-    @{[load $T3, $index, 3]}
-    @{[load $T4, $index, 13]}
-    @{[load $T5, $index, 6]}
-    xor $TMP0, $T1, $T2
-    @{[roriw $TMP1, $T3, 17]}
-    xor $T6, $TMP0, $TMP1
-    @{[P1 $T6]}
-    @{[roriw $TMP1, $T4, 25]}
-    xor $T6, $T6, $TMP1
-    xor $T6, $T6, $T5
-    @{[store $T6, $index, 0]}
+    my $w16 = Wreg($index, 0, $T1);
+    my $w9 = Wreg($index, 9, $T2);
+    my $w3 = Wreg($index, 3, $T3);
+    my $w13 = Wreg($index, 13, $T4);
+    my $w6 = Wreg($index, 6, $T5);
+    # W[j] goes into the register holding W[j-16], so W[j-16] must be read first
+    my $wj = Wreg($index, 0, $T6);
+    my $code=<<___;
+    @{[Wload $index, 0, $T1]}
+    @{[Wload $index, 9, $T2]}
+    @{[Wload $index, 3, $T3]}
+    @{[Wload $index, 13, $T4]}
+    @{[Wload $index, 6, $T5]}
+    xor $TMP0, $w16, $w9
+    @{[roriw $TMP1, $w3, 17]}
+    @{[roriw $T1, $w13, 25]}
+    xor $wj, $TMP0, $TMP1
+    xor $T1, $T1, $w6
+    @{[P1 $wj]}
+    xor $wj, $wj, $T1
+    @{[Wstore $index, 0, $T6]}
 ___
     return $code;
 }
 
+# Terms that do not depend on E are summed first to shorten the E -> E' chain
 sub SM3ROUND1 {
     my ($index, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
+    my $wj = Wreg($index, 0, $T5);   # W[j]
+    my $w4 = Wreg($index, 12, $T2);  # W[j+4]
     my $code=<<___;
-    @{[load $Wi, $index, 0]}
-    @{[load $T2, $index, 12]}
-    xor $Wj, $Wi, $T2
-    lw $T1, 4*$index($KT)
+    @{[Wload $index, 0, $T5]}
+    @{[Wload $index, 12, $T2]}
+    lw $T1, 4*$index($KT) # T1 = Tj
+    xor $T6, $wj, $w4 # T6 = W'[j] = W[j] ^ W[j+4]
     @{[roriw $T2, $a, 20]} # T2 = A12
-    addw $T3, $T2, $e # T3 = A12_SM = A12 + E
-    addw $T3, $T3, $T1 # T3 = A12_SM = A12 + E + Tj
-    @{[roriw $T3, $T3, 25]} # T3 = SS1
     @{[FG0 $a, $b, $c]}
+    addw $T3, $T2, $T1 # T3 = A12 + Tj
     addw $T4, $TMP0, $d # T4 = FF + D
-    xor $T1, $T3, $T2 # T1 = SS1 ^ A12
-    addw $T1, $T1, $T4 # T1 = T4 + T1 = FF + D + (SS1 ^ A12)
-    addw $d, $T1, $Wj # d = T1 + Wj
+    addw $T3, $T3, $e # T3 = A12 + Tj + E
+    addw $T4, $T4, $T6 # T4 = FF + D + W'
+    @{[roriw $T3, $T3, 25]} # T3 = SS1
+    addw $h, $h, $wj # h = H + W
+    xor $T1, $T3, $T2 # T1 = SS2 = SS1 ^ A12
     @{[FG0 $e, $f, $g]}
+    addw $d, $T1, $T4 # d = TT1
     @{[roriw $b, $b, 23]}
-    @{[roriw $f, $f, 13]}
     addw $T1, $TMP0, $T3 # T1 = GG + SS1
-    addw $T1, $T1, $Wi # T1 = GG + SS1 + Wj
-    addw $h, $h, $T1
+    @{[roriw $f, $f, 13]}
+    addw $h, $h, $T1 # h = TT2
     @{[P0 $h]}
 
 ___
@@ -190,107 +207,78 @@ ___
 
 sub SM3ROUND2 {
     my ($index, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
+    my $wj = Wreg($index, 0, $T5);   # W[j]
+    my $w4 = Wreg($index, 12, $T2);  # W[j+4]
     my $code=<<___;
-    @{[load $Wi, $index, 0]}
-    @{[load $T2, $index, 12]}
-    xor $Wj, $Wi, $T2
-    lw $T1, 4*$index($KT)
+    @{[Wload $index, 0, $T5]}
+    @{[Wload $index, 12, $T2]}
+    lw $T1, 4*$index($KT) # T1 = Tj
+    xor $T6, $wj, $w4 # T6 = W'[j] = W[j] ^ W[j+4]
     @{[roriw $T2, $a, 20]} # T2 = A12
-    addw $T3, $T2, $e # T3 = A12_SM = A12 + E
-    addw $T3, $T3, $T1 # T3 = A12_SM = A12 + E + Tj
-    @{[roriw $T3, $T3, 25]} # T3 = SS1
     @{[FF1 $a, $b, $c]}
+    addw $T3, $T2, $T1 # T3 = A12 + Tj
     addw $T4, $TMP0, $d # T4 = FF + D
-    xor $T1, $T3, $T2 # T1 = SS1 ^ A12
-    addw $T1, $T1, $T4 # T1 = T4 + T1 = FF + D + (SS1 ^ A12)
-    addw $d, $T1, $Wj # d = T1 + Wj
+    addw $T3, $T3, $e # T3 = A12 + Tj + E
+    addw $T4, $T4, $T6 # T4 = FF + D + W'
+    @{[roriw $T3, $T3, 25]} # T3 = SS1
+    addw $h, $h, $wj # h = H + W
+    xor $T1, $T3, $T2 # T1 = SS2 = SS1 ^ A12
     @{[GG1 $e, $f, $g]}
+    addw $d, $T1, $T4 # d = TT1
     @{[roriw $b, $b, 23]}
-    @{[roriw $f, $f, 13]}
     addw $T1, $TMP0, $T3 # T1 = GG + SS1
-    addw $T1, $T1, $Wi # T1 = GG + SS1 + Wj
-    addw $h, $h, $T1
+    @{[roriw $f, $f, 13]}
+    addw $h, $h, $T1 # h = TT2
     @{[P0 $h]}
 
 ___
     return $code;
 }
 
+# One ld plus rev8 yields two message words, the first in the top half
 sub loadMsgRev32 {
     my $code=<<___;
 
-    lw $T1, ($INP)
+    ld $T1, 0($INP)
     @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
-    sw $T1, ($ADDR)
-
-    lw $T1, 4($INP)
-    @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
+    srli $T2, $T1, 32
+    sw $T2, 0($ADDR)
     sw $T1, 4($ADDR)
 
-    lw $T1, 8($INP)
+    ld $T1, 8($INP)
     @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
-    sw $T1, 8($ADDR)
-
-    lw $T1, 12($INP)
-    @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
+    srli $T2, $T1, 32
+    sw $T2, 8($ADDR)
     sw $T1, 12($ADDR)
 
-    lw $T1, 16($INP)
+    ld $T1, 16($INP)
     @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
-    sw $T1, 16($ADDR)
-
-    lw $T1, 20($INP)
-    @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
+    srli $T2, $T1, 32
+    sw $T2, 16($ADDR)
     sw $T1, 20($ADDR)
 
-    lw $T1, 24($INP)
+    ld $T1, 24($INP)
     @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
-    sw $T1, 24($ADDR)
-
-    lw $T1, 28($INP)
-    @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
+    srli $T2, $T1, 32
+    sw $T2, 24($ADDR)
     sw $T1, 28($ADDR)
 
-    lw $T1, 32($INP)
-    @{[rev8 $T1, $T1]}
-    srli $T1, $T1, 32
-    sw $T1, 32($ADDR)
+    ld $W9, 32($INP)
+    @{[rev8 $W9, $W9]}
+    srli $T2, $W9, 32
+    sw $T2, 32($ADDR)
 
-    lw $T1, 36($INP)
-    @{[rev8 $T1, $T1]}
-    srli $W9, $T1, 32
+    ld $W11, 40($INP)
+    @{[rev8 $W11, $W11]}
+    srli $W10, $W11, 32
 
-    lw $T1, 40($INP)
-    @{[rev8 $T1, $T1]}
-    srli $W10, $T1, 32
+    ld $W13, 48($INP)
+    @{[rev8 $W13, $W13]}
+    srli $W12, $W13, 32
 
-    lw $T1, 44($INP)
-    @{[rev8 $T1, $T1]}
-    srli $W11, $T1, 32
-
-    lw $T1, 48($INP)
-    @{[rev8 $T1, $T1]}
-    srli $W12, $T1, 32
-
-    lw $T1, 52($INP)
-    @{[rev8 $T1, $T1]}
-    srli $W13, $T1, 32
-
-    lw $T1, 56($INP)
-    @{[rev8 $T1, $T1]}
-    srli $W14, $T1, 32
-
-    lw $T1, 60($INP)
-    @{[rev8 $T1, $T1]}
-    srli $W15, $T1, 32
+    ld $W15, 56($INP)
+    @{[rev8 $W15, $W15]}
+    srli $W14, $W15, 32
 ___
     return $code;
 }
@@ -336,7 +324,7 @@ L_round_loop:
     # Decrement length by 1
     addi $LEN, $LEN, -1
 
-    @{[loadMsgRev32]}
+@{[loadMsgRev32]}
 
     @{[SM3ROUND1 0, $A, $B, $C, $D, $E, $F, $G, $H]}
     @{[EXPAND 0]}
