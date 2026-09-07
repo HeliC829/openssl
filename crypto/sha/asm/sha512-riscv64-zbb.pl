@@ -2,7 +2,7 @@
 # This file is dual-licensed, meaning that you can use it under your
 # choice of either of the following two licenses:
 #
-# Copyright 2025 The OpenSSL Project Authors. All Rights Reserved.
+# Copyright 2025-2026 The OpenSSL Project Authors. All Rights Reserved.
 #
 # Licensed under the Apache License 2.0 (the "License"). You can obtain
 # a copy in the file LICENSE in the source distribution or at
@@ -10,7 +10,7 @@
 #
 # or
 #
-# Copyright (c) 2025, Julian Zhu <julian.oerv@isrc.iscas.ac.cn>
+# Copyright (c) 2025-2026, Julian Zhu <julian.oerv@isrc.iscas.ac.cn>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -62,102 +62,104 @@ my $K512 = "K512";
 # Function arguments
 my ($INP, $LEN, $ADDR) = ("a1", "a2", "sp");
 my ($KT, $T1, $T2, $T3, $T4, $T5, $T6) = ("t0", "t1", "t2", "t3", "t4", "t5", "t6");
+# Register pairs indexed by round parity, reused by later rounds:
+# W = W[i], U = W[i-15] (next round's W[i-16]), X = a ^ b (next round's b ^ c)
+my ($W0, $W1, $U0, $U1, $X0, $X1) = ("a5", "a6", "a7", "s0", "s1", "s10");
 my ($A, $B, $C, $D ,$E ,$F ,$G ,$H) = ("s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9");
 
 sub MSGSCHEDULE0 {
-    my (
-        $index,
-    ) = @_;
+    my ($index) = @_;
+    my $Wi = ($index & 1) ? $W1 : $W0;
     my $code=<<___;
-    ld $T1, (8*$index+0)($INP)
-    @{[rev8 $T1, $T1]}
-    sd $T1, 8*$index($ADDR)
+    ld $Wi, 8*$index($INP)
+    @{[rev8 $Wi, $Wi]}
+    sd $Wi, 8*$index($ADDR)
 ___
 
     return $code;
 }
 
+# W[i-2] and W[i-16] are already in registers, only W[i-7] and W[i-15] are loaded
 sub MSGSCHEDULE1 {
-    my (
-        $INDEX,
-    ) = @_;
+    my ($INDEX) = @_;
+    my $Wi2 = ($INDEX & 1) ? $W1 : $W0;
+    # W[i] goes into the register holding W[i-2], so only the final add may write it
+    my $Wi = $Wi2;
+    my $Wi15 = ($INDEX & 1) ? $U1 : $U0;
+    my $Wi16 = ($INDEX & 1) ? $U0 : $U1;
     my $code=<<___;
-    ld $T1, (($INDEX-2)&0x0f)*8($ADDR)
-    ld $T2, (($INDEX-15)&0x0f)*8($ADDR)
     ld $T3, (($INDEX-7)&0x0f)*8($ADDR)
-    ld $T4, ($INDEX&0x0f)*8($ADDR)
-    @{[rori $T5, $T1, 19]}
-    @{[rori $T6, $T1, 61]}
-    srli $T1, $T1, 6
+    ld $Wi15, (($INDEX-15)&0x0f)*8($ADDR)
+    @{[rori $T5, $Wi2, 19]}
+    @{[rori $T6, $Wi2, 61]}
+    srli $T1, $Wi2, 6
     xor $T1, $T1, $T5
     xor $T1, $T1, $T6
     add $T1, $T1, $T3
-    @{[rori $T5, $T2, 1]}
-    @{[rori $T6, $T2, 8]}
-    srli $T2, $T2, 7
+    @{[rori $T5, $Wi15, 1]}
+    @{[rori $T6, $Wi15, 8]}
+    srli $T2, $Wi15, 7
     xor $T2, $T2, $T5
     xor $T2, $T2, $T6
-    add $T1, $T1, $T2
-    add $T1, $T1, $T4
-    sd $T1, 8*($INDEX&0x0f)($ADDR)
+    add $T2, $T2, $Wi16
+    add $Wi, $T1, $T2
+    sd $Wi, 8*($INDEX&0x0f)($ADDR)
 ___
 
     return $code;
 }
 
+# Sigma1 and Ch are summed as a tree so that adjacent instructions are independent
 sub sha512_T1 {
-    my (
-        $INDEX, $e, $f, $g, $h,
-    ) = @_;
+    my ($INDEX, $e, $f, $g, $h) = @_;
+    my $Wi = ($INDEX & 1) ? $W1 : $W0;
     my $code=<<___;
     ld $T4, 8*$INDEX($KT)
-    add $h, $h, $T1
-    add $h, $h, $T4
     @{[rori $T2, $e, 14]}
     @{[rori $T3, $e, 18]}
-    @{[rori $T4, $e, 41]}
-    xor $T2, $T2, $T3
+    @{[rori $T5, $e, 41]}
+    add $h, $h, $Wi
     xor $T1, $f, $g
-    xor $T2, $T2, $T4
+    add $h, $h, $T4
+    xor $T2, $T2, $T3
     and $T1, $T1, $e
-    add $h, $h, $T2
+    xor $T2, $T2, $T5
     xor $T1, $T1, $g
-    add $T1, $T1, $h
+    add $T2, $T2, $h
+    add $T1, $T1, $T2
 ___
 
     return $code;
 }
 
+# Maj(a, b, c) = ((a ^ b) & (b ^ c)) ^ b, where b ^ c is the previous round's a ^ b
 sub sha512_T2 {
-    my (
-        $a, $b, $c,
-    ) = @_;
+    my ($INDEX, $a, $b, $c) = @_;
+    my $Xab = ($INDEX & 1) ? $X1 : $X0;
+    my $Xbc = ($INDEX & 1) ? $X0 : $X1;
     my $code=<<___;
     # Sigma0
     @{[rori $T2, $a, 28]}
     @{[rori $T3, $a, 34]}
     @{[rori $T4, $a, 39]}
-    xor $T2, $T2, $T3
     # Maj
-    xor $T5, $b, $c
-    and $T3, $b, $c
-    and $T5, $T5, $a
+    xor $Xab, $a, $b
+    xor $T2, $T2, $T3
+    and $T5, $Xab, $Xbc
     xor $T2, $T2, $T4
-    xor $T3, $T3, $T5
+    xor $T5, $T5, $b
     # T2
-    add $T2, $T2, $T3
+    add $T2, $T2, $T5
 ___
 
     return $code;
 }
 
 sub SHA512ROUND {
-    my (
-        $INDEX, $a, $b, $c, $d, $e, $f, $g, $h
-    ) = @_;
+    my ($INDEX, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
     my $code=<<___;
     @{[sha512_T1 $INDEX, $e, $f, $g, $h]}
-    @{[sha512_T2 $a, $b, $c]}
+    @{[sha512_T2 $INDEX, $a, $b, $c]}
     add $d, $d, $T1
     add $h, $T2, $T1
 ___
@@ -166,9 +168,7 @@ ___
 }
 
 sub SHA512ROUND0 {
-    my (
-        $INDEX, $a, $b, $c, $d, $e, $f, $g, $h
-    ) = @_;
+    my ($INDEX, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
     my $code=<<___;
     @{[MSGSCHEDULE0 $INDEX]}
     @{[SHA512ROUND $INDEX, $a, $b, $c, $d, $e, $f, $g, $h]}
@@ -178,9 +178,7 @@ ___
 }
 
 sub SHA512ROUND1 {
-    my (
-        $INDEX, $a, $b, $c, $d, $e, $f, $g, $h
-    ) = @_;
+    my ($INDEX, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
     my $code=<<___;
     @{[MSGSCHEDULE1 $INDEX]}
     @{[SHA512ROUND $INDEX, $a, $b, $c, $d, $e, $f, $g, $h]}
@@ -230,6 +228,9 @@ L_round_loop:
     # Decrement length by 1
     addi $LEN, $LEN, -1
 
+    # b ^ c for round 0's Maj
+    xor $X1, $B, $C
+
     @{[SHA512ROUND0 0, $A, $B, $C, $D, $E, $F, $G, $H]}
     @{[SHA512ROUND0 1, $H, $A, $B, $C, $D, $E, $F, $G]}
     @{[SHA512ROUND0 2, $G, $H, $A, $B, $C, $D, $E, $F]}
@@ -249,6 +250,9 @@ L_round_loop:
     @{[SHA512ROUND0 13, $D, $E, $F, $G, $H, $A, $B, $C]}
     @{[SHA512ROUND0 14, $C, $D, $E, $F, $G, $H, $A, $B]}
     @{[SHA512ROUND0 15, $B, $C, $D, $E, $F, $G, $H, $A]}
+
+    # W[0], the W[i-16] of round 16
+    ld $U1, 0($ADDR)
 
     @{[SHA512ROUND1 16, $A, $B, $C, $D, $E, $F, $G, $H]}
     @{[SHA512ROUND1 17, $H, $A, $B, $C, $D, $E, $F, $G]}
