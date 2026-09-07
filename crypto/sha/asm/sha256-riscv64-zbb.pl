@@ -66,20 +66,37 @@ my $K256 = "K256";
 # Function arguments
 my ($INP, $LEN, $ADDR) = ("a1", "a2", "sp");
 my ($KT, $T1, $T2, $T3, $T4, $T5, $T6, $T7, $T8) = ("t0", "t1", "t2", "t3", "t4", "t5", "t6", "a3", "a4");
+# Funnel shift amounts for misaligned input. Only Zbb uses them, and it never
+# needs the RV64I rotate scratch they alias.
+my ($SHL, $SHR) = ($T7, $T8);
 # Register pairs indexed by round parity, reused by later rounds:
 # W = W[i], U = W[i-15] (next round's W[i-16]), X = a ^ b (next round's b ^ c)
 my ($W0, $W1, $U0, $U1, $X0, $X1) = ("a5", "a6", "a7", "s0", "s1", "s10");
 my ($A, $B, $C, $D ,$E ,$F ,$G ,$H) = ("s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9");
 
 sub MSGSCHEDULE0 {
-    my ($index) = @_;
+    my ($ALIGNED, $index) = @_;
     if ($use_zbb) {
         # Odd rounds: W[i] was already loaded and byte-swapped into W1 by the previous round
         if ($index & 1) {
             return "";
         }
-        my $code=<<___;
+        my $code;
+        if ($ALIGNED) {
+            $code=<<___;
         ld $W1, 4*$index($INP)
+___
+        } else {
+            # $INP is 8 byte aligned here, so combine two aligned loads
+            $code=<<___;
+        ld $T5, 4*$index($INP)
+        ld $T6, (4*$index+8)($INP)
+        srl $W1, $T5, $SHL
+        sll $T6, $T6, $SHR
+        or $W1, $W1, $T6
+___
+        }
+        $code .= <<___;
         @{[rev8 $W1, $W1]} # rev8 $W1, $W1
         srli $W0, $W1, 32
         sw $W0, 4*$index($ADDR)
@@ -248,9 +265,9 @@ ___
 }
 
 sub SHA256ROUND0 {
-    my ($INDEX, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
+    my ($ALIGNED, $INDEX, $a, $b, $c, $d, $e, $f, $g, $h) = @_;
     my $code=<<___;
-    @{[MSGSCHEDULE0 $INDEX]}
+    @{[MSGSCHEDULE0 $ALIGNED, $INDEX]}
     @{[SHA256ROUND $INDEX, $a, $b, $c, $d, $e, $f, $g, $h]}
 ___
 
@@ -264,6 +281,18 @@ sub SHA256ROUND1 {
     @{[SHA256ROUND $INDEX, $a, $b, $c, $d, $e, $f, $g, $h]}
 ___
 
+    return $code;
+}
+
+# Rounds 0..15, which read the message block
+sub SHA256ROUNDS0 {
+    my ($ALIGNED) = @_;
+    my @s = ($A, $B, $C, $D, $E, $F, $G, $H);
+    my $code = "";
+    for my $i (0 .. 15) {
+        $code .= SHA256ROUND0($ALIGNED, $i, @s);
+        unshift @s, pop @s;
+    }
     return $code;
 }
 
@@ -303,6 +332,23 @@ sha256_block_data_order@{[$isaext]}:
     lw $F, 20(a0)
     lw $G, 24(a0)
     lw $H, 28(a0)
+___
+
+if ($use_zbb) {
+$code .= <<___;
+
+    # For misaligned input, round \$INP down and set up the funnel shift.
+    # \$SHL stays non-zero for the whole call and doubles as the flag.
+    andi $SHL, $INP, 7
+    beqz $SHL, L_round_loop
+    andi $INP, $INP, -8
+    slli $SHL, $SHL, 3
+    li $T1, 64
+    sub $SHR, $T1, $SHL
+___
+}
+
+$code .= <<___;
 
 L_round_loop:
     # Decrement length by 1
@@ -310,27 +356,23 @@ L_round_loop:
 
     # b ^ c for round 0's Maj
     xor $X1, $B, $C
+___
 
-    @{[SHA256ROUND0 0, $A, $B, $C, $D, $E, $F, $G, $H]}
-    @{[SHA256ROUND0 1, $H, $A, $B, $C, $D, $E, $F, $G]}
-    @{[SHA256ROUND0 2, $G, $H, $A, $B, $C, $D, $E, $F]}
-    @{[SHA256ROUND0 3, $F, $G, $H, $A, $B, $C, $D, $E]}
+if ($use_zbb) {
+    $code .= <<___;
+    bnez $SHL, L_load_unaligned
+@{[SHA256ROUNDS0 1]}
+    j L_message_schedule
+L_load_unaligned:
+@{[SHA256ROUNDS0 0]}
+L_message_schedule:
+___
+} else {
+    # Byte loads work at any alignment
+    $code .= SHA256ROUNDS0(1);
+}
 
-    @{[SHA256ROUND0 4, $E, $F, $G, $H, $A, $B, $C, $D]}
-    @{[SHA256ROUND0 5, $D, $E, $F, $G, $H, $A, $B, $C]}
-    @{[SHA256ROUND0 6, $C, $D, $E, $F, $G, $H, $A, $B]}
-    @{[SHA256ROUND0 7, $B, $C, $D, $E, $F, $G, $H, $A]}
-
-    @{[SHA256ROUND0 8, $A, $B, $C, $D, $E, $F, $G, $H]}
-    @{[SHA256ROUND0 9, $H, $A, $B, $C, $D, $E, $F, $G]}
-    @{[SHA256ROUND0 10, $G, $H, $A, $B, $C, $D, $E, $F]}
-    @{[SHA256ROUND0 11, $F, $G, $H, $A, $B, $C, $D, $E]}
-
-    @{[SHA256ROUND0 12, $E, $F, $G, $H, $A, $B, $C, $D]}
-    @{[SHA256ROUND0 13, $D, $E, $F, $G, $H, $A, $B, $C]}
-    @{[SHA256ROUND0 14, $C, $D, $E, $F, $G, $H, $A, $B]}
-    @{[SHA256ROUND0 15, $B, $C, $D, $E, $F, $G, $H, $A]}
-
+$code .= <<___;
     # W[0], the W[i-16] of round 16
     lw $U1, 0($ADDR)
 
