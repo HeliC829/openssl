@@ -255,6 +255,12 @@ jobs:
         .github/workflows/make-test \
                   TESTS="test_evp*" \
                   QEMU_LD_PREFIX=/usr/${{ matrix.platform.arch }}
+    - name: make internal tests
+      if: env.EXTENDED != 'true' && matrix.platform.tests != 'none'
+      run: |
+        .github/workflows/make-test \
+                  TESTS="test_internal*" \
+                  QEMU_LD_PREFIX=/usr/${{ matrix.platform.arch }}
     - name: save artifacts
       if: success() || failure()
       uses: actions/upload-artifact@v5
