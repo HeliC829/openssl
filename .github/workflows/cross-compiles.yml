@@ -63,6 +63,7 @@ jobs:
         #                this string will be used as content for the OpenSSL
         #                capabilities variable.
         #   ppa:   Launchpad PPA repository to download packages from.
+        #   runner: optional GitHub Actions runner label; defaults to ubuntu-latest.
         platform: [
           {
             arch: i386-pc-msdosdjgpp,
@@ -138,6 +139,12 @@ jobs:
             target: linux64-riscv64,
             fips: no
           }, {
+            arch: loongarch64-linux-gnu,
+            libs: libc6-dev-loong64-cross qemu-user-binfmt,
+            target: linux64-loongarch64,
+            fips: no,
+            runner: ubuntu-26.04
+          }, {
             arch: s390x-linux-gnu,
             libs: libc6-dev-s390x-cross,
             target: linux64-s390x,
@@ -183,7 +190,7 @@ jobs:
             tests: none
           }
         ]
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.platform.runner || 'ubuntu-latest' }}
     steps:
     - name: install package repository
       if: matrix.platform.ppa != ''
@@ -217,7 +224,7 @@ jobs:
       run: ./configdata.pm --dump
 
     - name: make
-      run: make -s -j4
+      run: make -s -j
 
     - name: install qemu
       if: matrix.platform.tests != 'none'
